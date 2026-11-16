@@ -13,6 +13,7 @@ import type { EmailFull } from "./schemas";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
 import { formatQuotedDate } from "../../shared/dates";
+import { deriveBodyText, type BodyParts } from "../../shared/body-parts";
 
 // ── DO Stub ────────────────────────────────────────────────────────
 
@@ -32,14 +33,29 @@ export function getMailboxStub(
 // ── Mailbox Listing ────────────────────────────────────────────────
 
 /**
+ * Collect every object key under `prefix`, following R2's `truncated` /
+ * `cursor` pagination (a single list() returns at most 1000 keys).
+ */
+async function listAllKeys(
+	bucket: R2Bucket,
+	prefix: string,
+	cursor?: string,
+): Promise<string[]> {
+	const page = await bucket.list({ prefix, cursor });
+	const keys = page.objects.map((obj) => obj.key);
+	if (!page.truncated) return keys;
+	return [...keys, ...(await listAllKeys(bucket, prefix, page.cursor))];
+}
+
+/**
  * List all mailboxes from R2 bucket metadata.
  */
 export async function listMailboxes(
 	bucket: R2Bucket,
 ): Promise<{ id: string; email: string }[]> {
-	const list = await bucket.list({ prefix: "mailboxes/" });
-	return list.objects.map((obj) => {
-		const id = obj.key.replace("mailboxes/", "").replace(".json", "");
+	const keys = await listAllKeys(bucket, "mailboxes/");
+	return keys.map((key) => {
+		const id = key.replace("mailboxes/", "").replace(".json", "");
 		return { id, email: id };
 	});
 }
@@ -90,6 +106,27 @@ export function generateMessageId(fromDomain: string): {
 	const outgoingMessageId = `${messageId}@${fromDomain}`;
 	return { messageId, outgoingMessageId };
 }
+
+/**
+ * Rewrite the `message-id` entry of a stored raw_headers JSON array so the
+ * header view shows the ID that was actually delivered. Malformed or missing
+ * JSON is returned unchanged.
+ */
+export const replaceMessageIdHeader = (
+	rawHeaders: string | null,
+	messageId: string,
+): string | null => {
+	if (!rawHeaders) return rawHeaders;
+	try {
+		const headers = JSON.parse(rawHeaders) as { key: string; value: string }[];
+		if (!Array.isArray(headers)) return rawHeaders;
+		return JSON.stringify(
+			headers.map((h) => (h.key.toLowerCase() === "message-id" ? { ...h, value: `<${messageId}>` } : h)),
+		);
+	} catch {
+		return rawHeaders;
+	}
+};
 
 // ── Threading ──────────────────────────────────────────────────────
 
@@ -175,36 +212,25 @@ export function textToHtml(text: string): string {
 }
 
 /**
- * Strip HTML tags and normalize whitespace to produce plain text.
- * Removes <style> and <script> blocks first to avoid injecting their
- * content into the output.
- */
-export function stripHtmlToText(html: string): string {
-	if (!html) return "";
-	return html
-		.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-		.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-		.replace(/<[^>]+>/g, " ")
-		.replace(/\s+/g, " ")
-		.trim();
-}
-
-/**
  * Format a date string for use in quoted reply blocks.
  * @deprecated Use `formatQuotedDate` from `shared/dates` directly.
  */
 export const formatEmailDate = formatQuotedDate;
 
+// Body-part helpers live in shared/ so the worker and the app derive plain
+// text identically. Re-exported here because worker code imports them from
+// this module.
+export { stripHtmlToText, deriveBodyText } from "../../shared/body-parts";
+
 /**
  * Build a quoted reply block HTML string from original email data.
  */
-export function buildQuotedReplyBlock(original: {
-	date?: string;
-	sender?: string;
-	body?: string;
-}): string {
-	if (!original.body) return "";
-	
+export function buildQuotedReplyBlock(
+	original: { date?: string; sender?: string } & BodyParts,
+): string {
+	const plainBody = deriveBodyText(original);
+	if (!plainBody) return "";
+
 	// HTML-escape sender and date to prevent injection
 	const originalSender = escapeHtml(original.sender || "unknown");
 	const originalDate = escapeHtml(formatEmailDate(original.date || ""));
@@ -213,7 +239,6 @@ export function buildQuotedReplyBlock(original: {
 	// The original HTML renders safely in the sandboxed iframe, but quoted
 	// reply blocks are injected into the compose editor and outgoing emails
 	// where raw HTML would execute. Convert to escaped plain text instead.
-	const plainBody = stripHtmlToText(original.body);
 	const bodyToQuote = escapeHtml(plainBody).replace(/\n/g, "<br>");
 
 	return `<br><blockquote style="border-left: 2px solid #ccc; margin: 0; padding-left: 1em; color: #666;">On ${originalDate}, ${originalSender} wrote:<br><br>${bodyToQuote}</blockquote>`;
@@ -236,8 +261,7 @@ export async function getFullEmail(
 	const email = (await stub.getEmail(emailId)) as EmailFull | null;
 	if (!email) return null;
 
-	const textBody = email.body ? stripHtmlToText(email.body) : "";
-	return { ...email, body_text: textBody, body_html: email.body };
+	return { ...email, body_text: deriveBodyText(email), body_html: email.body_html ?? null };
 }
 
 /**
@@ -253,8 +277,7 @@ export async function getFullThread(
 	const emails = await threadStub.getThreadEmails(threadId);
 
 	const enriched = emails.map((email) => {
-		const textBody = email.body ? stripHtmlToText(email.body) : "";
-		return { ...email, body_text: textBody };
+		return { ...email, body_text: deriveBodyText(email) };
 	});
 
 	// Already sorted ASC by the DO query, but ensure consistency

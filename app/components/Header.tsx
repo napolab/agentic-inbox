@@ -2,11 +2,19 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import { Button, Input, Tooltip } from "@cloudflare/kumo";
-import { GearSixIcon, ListIcon, MagnifyingGlassIcon, RobotIcon, XIcon } from "@phosphor-icons/react";
-import { type KeyboardEvent, useEffect, useState } from "react";
+import { Button, Input, Tooltip, useKumoToastManager } from "@cloudflare/kumo";
+import { BellIcon, BellSlashIcon, GearSixIcon, ListIcon, MagnifyingGlassIcon, RobotIcon, XIcon } from "@phosphor-icons/react";
+import { type KeyboardEvent, useCallback, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router";
+import ThemeMenu from "~/components/ThemeMenu";
+import { type PushStatus, usePushNotifications } from "~/hooks/usePushNotifications";
 import { useUIStore } from "~/hooks/useUIStore";
+
+const pushTooltipLabel = (status: PushStatus): string => {
+	if (status === "subscribed") return "Disable push notifications";
+	if (status === "denied") return "Notifications are blocked in browser settings";
+	return "Enable push notifications";
+};
 
 export default function Header() {
 	const [searchQuery, setSearchQuery] = useState("");
@@ -16,6 +24,23 @@ export default function Header() {
 	const location = useLocation();
 	const [searchParams] = useSearchParams();
 	const { toggleSidebar, toggleAgentPanel, isAgentPanelOpen } = useUIStore();
+	const { status: pushStatus, enable: enablePush, disable: disablePush } = usePushNotifications();
+	const toastManager = useKumoToastManager();
+
+	const handlePushToggle = useCallback(async () => {
+		try {
+			if (pushStatus === "subscribed") {
+				await disablePush();
+				toastManager.add({ title: "Push notifications disabled" });
+				return;
+			}
+			const enabled = await enablePush();
+			if (enabled) toastManager.add({ title: "Push notifications enabled" });
+		} catch (error) {
+			console.error(error);
+			toastManager.add({ title: "Failed to update push notifications", variant: "error" });
+		}
+	}, [pushStatus, enablePush, disablePush, toastManager]);
 
 	// Sync search input with URL query param so it stays populated
 	const urlQuery = searchParams.get("q") || "";
@@ -119,6 +144,19 @@ export default function Header() {
 			)}
 
 			<div className="flex items-center gap-1 ml-auto shrink-0">
+				{pushStatus !== "unsupported" && pushStatus !== "pending" && (
+					<Tooltip content={pushTooltipLabel(pushStatus)} side="bottom" asChild>
+						<Button
+							variant={pushStatus === "subscribed" ? "secondary" : "ghost"}
+							shape="square"
+							icon={pushStatus === "denied" ? <BellSlashIcon size={20} /> : <BellIcon size={20} />}
+							onClick={handlePushToggle}
+							disabled={pushStatus === "denied"}
+							aria-label="Toggle push notifications"
+						/>
+					</Tooltip>
+				)}
+				<ThemeMenu />
 				<Tooltip content={isAgentPanelOpen ? "Hide agent panel" : "Show agent panel"} side="bottom" asChild>
 					<Button
 						variant={isAgentPanelOpen ? "secondary" : "ghost"}

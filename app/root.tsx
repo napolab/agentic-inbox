@@ -22,6 +22,7 @@ import {
 	Scripts,
 	ScrollRestoration,
 } from "react-router";
+import { PushNotificationsProvider } from "~/hooks/usePushNotifications";
 import { ApiError } from "~/services/api";
 import "./index.css";
 
@@ -75,10 +76,16 @@ const KumoLink = forwardRef<
 	return <a href={href} ref={ref} {...props} />;
 });
 
+// Applies the stored/OS theme before first paint to avoid a light-mode
+// flash. Must stay in sync with the contract in app/hooks/useTheme.ts:
+// localStorage "theme" holds "light" | "dark"; absent means follow the OS.
+const themeInitScript = `(function(){try{var t=localStorage.getItem("theme");if(t==="dark"||(t!=="light"&&window.matchMedia("(prefers-color-scheme: dark)").matches)){document.documentElement.setAttribute("data-mode","dark")}}catch(e){}})();`;
+
 export function Layout({ children }: { children: React.ReactNode }) {
 	return (
-		<html lang="en">
+		<html lang="en" suppressHydrationWarning>
 			<head>
+				<script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
 				<meta charSet="UTF-8" />
 				<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 				<link
@@ -88,6 +95,26 @@ export function Layout({ children }: { children: React.ReactNode }) {
 					sizes="48x48 32x32 16x16"
 				/>
 				<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+				{/* use-credentials: the manifest is fetched WITHOUT cookies by default,
+				    which Cloudflare Access redirects to its login page — breaking
+				    installability. With credentials the CF_Authorization cookie rides
+				    along and the real manifest comes back. */}
+				<link
+					rel="manifest"
+					href="/manifest.webmanifest"
+					crossOrigin="use-credentials"
+				/>
+				<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+				<meta
+					name="theme-color"
+					media="(prefers-color-scheme: light)"
+					content="#ffffff"
+				/>
+				<meta
+					name="theme-color"
+					media="(prefers-color-scheme: dark)"
+					content="#1f1f1f"
+				/>
 				<title>Agentic Inbox</title>
 				<Meta />
 				<Links />
@@ -115,13 +142,15 @@ export default function App() {
 	const [queryClient] = useState(getQueryClient);
 	return (
 		<QueryClientProvider client={queryClient}>
-			<LinkProvider component={KumoLink}>
-				<TooltipProvider>
-					<Toasty>
-						<Outlet />
-					</Toasty>
-				</TooltipProvider>
-			</LinkProvider>
+			<PushNotificationsProvider>
+				<LinkProvider component={KumoLink}>
+					<TooltipProvider>
+						<Toasty>
+							<Outlet />
+						</Toasty>
+					</TooltipProvider>
+				</LinkProvider>
+			</PushNotificationsProvider>
 		</QueryClientProvider>
 	);
 }

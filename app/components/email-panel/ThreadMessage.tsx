@@ -13,11 +13,12 @@ import {
 } from "@phosphor-icons/react";
 import EmailAttachmentList from "~/components/EmailAttachmentList";
 import EmailIframe from "~/components/EmailIframe";
+import { deriveBodyText } from "shared/body-parts";
+import { plainTextToHtml } from "~/lib/email-content";
 import {
 	formatDetailDate,
 	formatShortDate,
 	rewriteInlineImages,
-	stripHtml,
 } from "~/lib/utils";
 import type { Email } from "~/types";
 
@@ -91,7 +92,7 @@ export default function ThreadMessage({
 							</span>
 						</div>
 						<p className="text-xs text-kumo-subtle truncate">
-							{stripHtml(email.body || "").slice(0, 80)}
+							{deriveBodyText(email).slice(0, 80)}
 						</p>
 					</div>
 					<CaretDownIcon size={14} className="text-kumo-subtle shrink-0" />
@@ -99,6 +100,8 @@ export default function ThreadMessage({
 			</div>
 		);
 	}
+
+	const bodyHtml = email.body_html ?? plainTextToHtml(email.body_text ?? "");
 
 	return (
 		<div className={`group/thread-msg ${containerClassName}`}>
@@ -159,7 +162,7 @@ export default function ThreadMessage({
 				<div className="md:ml-[42px]">
 					<EmailIframe
 						body={rewriteInlineImages(
-							email.body || "",
+							bodyHtml,
 							mailboxId || "",
 							email.id,
 							email.attachments,

@@ -1,8 +1,20 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
+	// Replace every "example" value below with your own before deploying.
+	// account_id is omitted: wrangler uses CLOUDFLARE_ACCOUNT_ID (or your
+	// logged-in account), so no account identifier lives in git.
 	"name": "agentic-inbox",
 	"compatibility_date": "2025-11-28",
 	"main": "./workers/app.ts",
+	"workers_dev": false,
+	"preview_urls": false,
+	"routes": [
+		{
+			// Keep in sync with APP_ORIGIN in workers/notifiers/format.ts.
+			"pattern": "inbox.example.com",
+			"custom_domain": true
+		}
+	],
 	"observability": {
 		"enabled": true
 	},
@@ -10,11 +22,16 @@
 		"nodejs_compat"
 	],
 	"vars": {
-		// Production deploys must also define POLICY_AUD and TEAM_DOMAIN.
-		// TEAM_DOMAIN may be the base Access URL or the full /cdn-cgi/access/certs URL.
-		// The worker now fails closed outside local development if Access is not configured.
+		// POLICY_AUD is intentionally NOT set here: it is created when one-click
+		// Access is enabled and stored as a Worker secret. The worker fails
+		// closed (HTTP 500) until then, which is the safe default.
+		// Comma-separated. Every listed domain must have its Email Routing
+		// catch-all pointed at this Worker, or mail for it never arrives.
 		"DOMAINS": "example.com",
-		"EMAIL_ADDRESSES": []
+		// Empty array = catch-all mode: any address on any DOMAINS entry gets a
+		// mailbox. Keep the key (typegen derives Env from it); do not delete it.
+		"EMAIL_ADDRESSES": [],
+		"TEAM_DOMAIN": "https://your-team.cloudflareaccess.com"
 	},
 	"send_email": [
 		{
@@ -45,6 +62,10 @@
 			{
 				"name": "EMAIL_MCP",
 				"class_name": "EmailMCP"
+			},
+			{
+				"name": "PUSH_SUBSCRIPTIONS",
+				"class_name": "PushSubscriptionsDO"
 			}
 		]
 	},
@@ -65,6 +86,12 @@
 			"tag": "v3",
 			"new_sqlite_classes": [
 				"EmailMCP"
+			]
+		},
+		{
+			"tag": "v4",
+			"new_sqlite_classes": [
+				"PushSubscriptionsDO"
 			]
 		}
 	]

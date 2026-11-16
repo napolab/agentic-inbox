@@ -13,6 +13,7 @@ export interface MailboxSettings {
 	forwarding?: { enabled: boolean; email: string };
 	signature?: SignatureSettings;
 	autoReply?: { enabled: boolean; subject: string; message: string };
+	autoDraft?: { enabled: boolean };
 	agentSystemPrompt?: string;
 }
 
@@ -35,13 +36,18 @@ export interface Email {
 	date: string;
 	read: boolean;
 	starred: boolean;
-	body?: string | null;
+	/** HTML MIME part; null/absent when the message has no HTML version. */
+	body_html?: string | null;
+	/** Plain-text MIME part; null/absent when the message has no text version. */
+	body_text?: string | null;
 	in_reply_to?: string | null;
 	email_references?: string | null;
 	message_id?: string | null;
 	raw_headers?: string | null;
 	attachments?: Attachment[];
 	snippet?: string | null;
+	/** 1 when `snippet` was cut from the HTML part, 0 when it is genuine plain text. */
+	snippet_is_html?: number;
 	// Thread aggregate fields (only present in threaded list view)
 	thread_count?: number;
 	thread_unread_count?: number;

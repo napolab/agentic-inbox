@@ -95,11 +95,25 @@ function decodeHtmlEntities(text: string): string {
 		.replace(/&nbsp;/g, " ");
 }
 
+/**
+ * Collapse a stored snippet down to a single display line.
+ *
+ * `isHtml` reflects the snippet's source MIME part (`snippet_is_html`). Genuine
+ * plain text must skip tag-stripping and entity decoding, otherwise literal
+ * content such as `<john@example.com>` or `a &lt; b` is silently destroyed.
+ */
 export function getSnippetText(
 	snippet?: string | null,
 	maxLength = 100,
+	isHtml = true,
 ): string {
 	if (!snippet) return "";
+
+	if (!isHtml) {
+		const plain = snippet.replace(/\s+/g, " ").trim();
+		if (!plain) return "";
+		return plain.length > maxLength ? `${plain.slice(0, maxLength)}...` : plain;
+	}
 
 	const clean = decodeHtmlEntities(
 		snippet
@@ -150,24 +164,19 @@ export function getSignatureBlock(settings?: {
 
 /**
  * Build a quoted reply block HTML string from original email data.
+ *
+ * `bodyText` must already be plain text — callers pass
+ * `deriveBodyText(original)` from `shared/body-parts`.
  */
 export function buildQuotedReplyBlock(
 	dateStr: string | undefined,
 	sender: string,
-	body: string,
+	bodyText: string,
 ): string {
-	if (!body) return "";
+	if (!bodyText) return "";
 	const formattedDate = formatComposeDate(dateStr);
-	
-	// HTML-escape sender to prevent <john@example.com> from disappearing as a tag
 	const escapedSender = escapeHtml(sender);
-
-	// Sanitize the body to plain text to prevent stored XSS.
-	// The original HTML renders safely in the sandboxed iframe, but quoted
-	// reply blocks are injected into the compose editor where raw HTML would
-	// execute. Convert to escaped plain text instead.
-	const bodyToQuote = escapeHtml(stripHtml(body)).replace(/\n/g, "<br>");
-
+	const bodyToQuote = escapeHtml(bodyText).replace(/\n/g, "<br>");
 	return `<br><blockquote style="border-left: 2px solid #ccc; margin: 0; padding-left: 1em; color: #666;">On ${formattedDate}, ${escapedSender} wrote:<br><br>${bodyToQuote}</blockquote>`;
 }
 

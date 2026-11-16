@@ -11,7 +11,7 @@ import EmailPanelHeader from "~/components/email-panel/EmailPanelHeader";
 import EmailPanelToolbar from "~/components/email-panel/EmailPanelToolbar";
 import SingleMessageView from "~/components/email-panel/SingleMessageView";
 import ThreadMessage from "~/components/email-panel/ThreadMessage";
-import { splitEmailList, toEmailListValue } from "~/lib/utils";
+import { escapeHtml, htmlToPlainText, splitEmailList, toEmailListValue } from "~/lib/utils";
 import api from "~/services/api";
 import { useDeleteEmail, useEmail, useMoveEmail, useReplyToEmail, useSendEmail, useThreadReplies, useUpdateEmail } from "~/queries/emails";
 import { useFolders } from "~/queries/folders";
@@ -124,8 +124,10 @@ export default function EmailPanel({ emailId }: { emailId: string }) {
 				bcc: toEmailListValue(splitEmailList(target.bcc)),
 				from,
 				subject: target.subject || "(no subject)",
-				html: target.body || "",
-				text: target.body ? target.body.replace(/<[^>]*>/g, "").trim() : "",
+				// A draft may hold only a text part (moved into Drafts by the user),
+				// so each MIME part falls back to the other one converted.
+				html: target.body_html || (target.body_text ? escapeHtml(target.body_text).replace(/\n/g, "<br>") : ""),
+				text: target.body_text || (target.body_html ? htmlToPlainText(target.body_html) : ""),
 			};
 			if (originalEmail) await replyMut.mutateAsync({ mailboxId, emailId: originalEmail.id, email: emailData }); else await sendEmailMut.mutateAsync({ mailboxId, email: emailData });
 			await deleteEmailMut.mutateAsync({ mailboxId, id: target.id });

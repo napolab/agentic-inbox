@@ -315,7 +315,11 @@ export default function EmailListRoute() {
 						<div>
 							{emails.map((email) => {
 								const isSelected = selectedEmailId === email.id;
-								const snippet = getSnippetText(email.snippet);
+								const snippet = getSnippetText(
+									email.snippet,
+									100,
+									Boolean(email.snippet_is_html ?? 1),
+								);
 								return (
 									<div
 										key={email.id}

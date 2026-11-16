@@ -18,6 +18,37 @@ export type MailboxContext = {
 	};
 };
 
+/**
+ * Create the mailbox R2 marker + default settings if it doesn't exist yet.
+ * Used by catch-all receive and the import endpoint, where mailboxes appear
+ * on first contact instead of via POST /api/v1/mailboxes.
+ */
+export async function ensureMailboxExists(env: Env, email: string): Promise<void> {
+	const key = `mailboxes/${email}.json`;
+	if (await env.BUCKET.head(key)) return;
+	const defaultSettings = {
+		fromName: email.split("@")[0],
+		forwarding: { enabled: false, email: "" },
+		signature: { enabled: false, text: "" },
+		autoReply: { enabled: false, subject: "", message: "" },
+	};
+	await env.BUCKET.put(key, JSON.stringify(defaultSettings));
+	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(email));
+	await stub.getFolders(); // initializes the DO's folder rows
+}
+
+/**
+ * Whether the per-mailbox auto-draft agent should run on inbound mail.
+ * Opt-in: true ONLY when `settings.autoDraft.enabled === true`; anything
+ * absent or malformed means off.
+ */
+export function isAutoDraftEnabled(settings: unknown): boolean {
+	if (typeof settings !== "object" || settings === null) return false;
+	const autoDraft = (settings as { autoDraft?: unknown }).autoDraft;
+	if (typeof autoDraft !== "object" || autoDraft === null) return false;
+	return (autoDraft as { enabled?: unknown }).enabled === true;
+}
+
 export const requireMailbox = createMiddleware<MailboxContext>(async (c, next) => {
 	const rawId = c.req.param("mailboxId");
 	if (!rawId) return c.json({ error: "Mailbox ID required" }, 400);

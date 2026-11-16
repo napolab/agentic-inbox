@@ -160,6 +160,13 @@ const api = {
 	// Search
 	searchEmails: (mailboxId: string, params: Record<string, string>) =>
 		get<EmailListResponse | Email[]>(`/api/v1/mailboxes/${mailboxId}/search`, { params }),
+
+	// Push notifications (device-global)
+	getVapidPublicKey: () => get<{ publicKey: string }>("/api/v1/push/vapid-public-key"),
+	savePushSubscription: (subscription: PushSubscriptionJSON) =>
+		put<void>("/api/v1/push/subscriptions", subscription),
+	deletePushSubscription: (endpoint: string) =>
+		del<void>(`/api/v1/push/subscriptions?endpoint=${encodeURIComponent(endpoint)}`),
 };
 
 export default api;

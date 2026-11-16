@@ -15,7 +15,7 @@ import type { EmailFull, EmailMetadata } from "../lib/schemas";
 import { verifyDraft, isPromptInjection } from "../lib/ai";
 import {
 	getMailboxStub,
-	stripHtmlToText,
+	deriveBodyText,
 	textToHtml,
 } from "../lib/email-helpers";
 import {
@@ -29,8 +29,22 @@ import {
 	toolMoveEmail,
 	toolDiscardDraft,
 } from "../lib/tools";
+import type { ToolError } from "../lib/tool-errors";
+import { logToolErrorCause, toToolErrorBody, type ToolErrorBody } from "../lib/tool-error-body";
 import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
 import type { Env } from "../types";
+
+/**
+ * Concatenate every body part of an email for injection scanning.
+ *
+ * The prompt text only ever contains ONE part (deriveBodyText picks the HTML
+ * one when present), but get_email/get_thread serve both — so the scan must
+ * cover both or an injection planted in the unread part slips through.
+ * isPromptInjection strips HTML internally, so raw HTML is fine here.
+ */
+function scanTextForParts(email: { body_html?: string | null; body_text?: string | null }): string {
+	return [email.body_html, email.body_text].filter(Boolean).join("\n\n---\n\n");
+}
 
 // AI SDK v6 changed tool() overloads significantly. We define tools as plain
 // objects matching the Tool type to avoid overload resolution issues.
@@ -107,6 +121,14 @@ async function getSystemPrompt(env: Env, mailboxId: string): Promise<string> {
 	return DEFAULT_SYSTEM_PROMPT;
 }
 
+const toolValue = <T>(value: T): T => value;
+
+// The model reads failures as `{ error, ...ids }` so it can recover in its next step.
+const toolErrorBody = (error: ToolError): ToolErrorBody => {
+	logToolErrorCause(error);
+	return toToolErrorBody(error);
+};
+
 function createEmailTools(env: Env, mailboxId: string) {
 	return {
 		list_emails: defineTool({
@@ -127,7 +149,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 					.describe("Page number for pagination"),
 			}),
 			execute: async ({ folder, limit, page }): Promise<unknown> => {
-				return toolListEmails(env, mailboxId, { folder, limit, page });
+				return toolListEmails(env, mailboxId, { folder, limit, page }).match(toolValue, toolErrorBody);
 			},
 		}),
 
@@ -138,7 +160,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 				emailId: z.string().describe("The email ID to retrieve"),
 			}),
 			execute: async ({ emailId }): Promise<unknown> => {
-				return toolGetEmail(env, mailboxId, emailId);
+				return toolGetEmail(env, mailboxId, emailId).match(toolValue, toolErrorBody);
 			},
 		}),
 
@@ -153,7 +175,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 					),
 			}),
 			execute: async ({ threadId }): Promise<unknown> => {
-				return toolGetThread(env, mailboxId, threadId);
+				return toolGetThread(env, mailboxId, threadId).match(toolValue, toolErrorBody);
 			},
 		}),
 
@@ -172,7 +194,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 					.describe("Optional folder to restrict search to"),
 			}),
 			execute: async ({ query, folder }): Promise<unknown> => {
-				return toolSearchEmails(env, mailboxId, { query, folder });
+				return toolSearchEmails(env, mailboxId, { query, folder }).match(toolValue, toolErrorBody);
 			},
 		}),
 
@@ -196,7 +218,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 					subject,
 					body,
 					isPlainText: true,
-				});
+				}).match(toolValue, toolErrorBody);
 			},
 		}),
 
@@ -225,7 +247,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 					body,
 					isPlainText: true,
 					runVerifyDraft: true,
-				});
+				}).match(toolValue, toolErrorBody);
 			},
 		}),
 
@@ -238,7 +260,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 					.describe("true to mark as read, false for unread"),
 			}),
 			execute: async ({ emailId, read }): Promise<unknown> => {
-				return toolMarkEmailRead(env, mailboxId, emailId, read);
+				return toolMarkEmailRead(env, mailboxId, emailId, read).match(toolValue, toolErrorBody);
 			},
 		}),
 
@@ -252,7 +274,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 					.describe(MOVE_FOLDER_TOOL_DESCRIPTION),
 			}),
 			execute: async ({ emailId, folderId }): Promise<unknown> => {
-				return toolMoveEmail(env, mailboxId, emailId, folderId);
+				return toolMoveEmail(env, mailboxId, emailId, folderId).match(toolValue, toolErrorBody);
 			},
 		}),
 
@@ -263,7 +285,7 @@ function createEmailTools(env: Env, mailboxId: string) {
 				draftId: z.string().describe("The ID of the draft to delete"),
 			}),
 			execute: async ({ draftId }): Promise<unknown> => {
-				return toolDiscardDraft(env, mailboxId, draftId);
+				return toolDiscardDraft(env, mailboxId, draftId).match(toolValue, toolErrorBody);
 			},
 		}),
 	};
@@ -346,8 +368,12 @@ export class EmailAgent extends AIChatAgent<any> {
 		let threadContext = "";
 		try {
 			const email = (await stub.getEmail(emailData.emailId)) as EmailFull | null;
-			if (email?.body) {
-				const isInjection = await isPromptInjection(env.AI, email.body);
+			if (email && (email.body_html || email.body_text)) {
+				const emailText = deriveBodyText(email);
+				// Scan everything the model could later read via get_email --
+				// that tool serves BOTH parts, so scanning only the derived
+				// text would leave an injection hidden in the other part.
+				const isInjection = await isPromptInjection(env.AI, scanTextForParts(email));
 				if (isInjection) {
 					console.warn("Skipping auto-draft due to detected prompt injection:", emailData.emailId);
 					
@@ -373,7 +399,7 @@ export class EmailAgent extends AIChatAgent<any> {
 					return;
 				}
 				
-				emailBody = stripHtmlToText(email.body);
+				emailBody = emailText;
 			}
 
 		// Load thread for conversation context
@@ -382,8 +408,9 @@ export class EmailAgent extends AIChatAgent<any> {
 			const fullThread = await Promise.all(
 				threadEmails.map(async (e) => {
 					const full = (await stub.getEmail(e.id)) as EmailFull | null;
-					const text = full?.body ? stripHtmlToText(full.body) : "";
-					return { id: e.id, sender: e.sender, recipient: e.recipient, subject: e.subject, date: e.date, folder_id: e.folder_id, body_text: text };
+					const text = full ? deriveBodyText(full) : "";
+					const scanText = full ? scanTextForParts(full) : "";
+					return { id: e.id, sender: e.sender, recipient: e.recipient, subject: e.subject, date: e.date, folder_id: e.folder_id, body_text: text, scan_text: scanText };
 				}),
 			);
 			fullThread.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
@@ -393,9 +420,15 @@ export class EmailAgent extends AIChatAgent<any> {
 
 			// Scan thread context for prompt injection too -- an attacker
 			// could plant an injection in an earlier email in the thread
-			// that gets included in the agent's prompt.
+			// that gets included in the agent's prompt. Scan BOTH parts of
+			// every thread email, not just the prompt text: get_thread serves
+			// the html part too, so a tool call can surface what the prompt hid.
 			if (threadContext) {
-				const threadInjection = await isPromptInjection(env.AI, threadContext);
+				const threadScanText = fullThread
+					.map((e) => e.scan_text)
+					.filter(Boolean)
+					.join("\n\n---\n\n");
+				const threadInjection = await isPromptInjection(env.AI, threadScanText);
 				if (threadInjection) {
 					console.warn("Skipping auto-draft due to prompt injection in thread context:", emailData.threadId);
 					const newMessages = [
@@ -495,12 +528,13 @@ Based on the email content and thread context above, draft a reply using draft_r
 							sender: emailData.mailboxId.toLowerCase(),
 							recipient: emailData.sender.toLowerCase(),
 							date: new Date().toISOString(),
-						// verifyDraft may return plain text or HTML depending on its
-						// code path. Only wrap in textToHtml if it's plain text.
-						body: /<[a-z][\s\S]*>/i.test(sanitizedText)
-							? sanitizedText
-							: textToHtml(sanitizedText),
-						in_reply_to: emailData.emailId,
+							// verifyDraft may return plain text or HTML depending on its
+							// code path. Only wrap in textToHtml if it's plain text.
+							body_html: /<[a-z][\s\S]*>/i.test(sanitizedText)
+								? sanitizedText
+								: textToHtml(sanitizedText),
+							body_text: null,
+							in_reply_to: emailData.emailId,
 							email_references: null,
 							thread_id: emailData.threadId,
 						},

@@ -6,6 +6,10 @@ body {
   margin: 0;
 }
 
+:root[data-mode="dark"] {
+	color-scheme: dark;
+}
+
 /* TipTap list styles */
 .ProseMirror ul {
   list-style-type: disc;

@@ -9,6 +9,7 @@
     "shared/**/*",
     "worker-configuration.d.ts"
   ],
+  "exclude": ["app/**/*.test.ts", "workers/**/*.test.ts"],
   "compilerOptions": {
     "composite": true,
     "strict": true,

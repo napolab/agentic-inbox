@@ -2,7 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import { Badge, Button, Input, Loader, useKumoToastManager } from "@cloudflare/kumo";
+import { Badge, Button, Input, Loader, Switch, useKumoToastManager } from "@cloudflare/kumo";
 import { RobotIcon, ArrowCounterClockwiseIcon } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import { useParams } from "react-router";
@@ -20,12 +20,14 @@ export default function SettingsRoute() {
 
 	const [displayName, setDisplayName] = useState("");
 	const [agentPrompt, setAgentPrompt] = useState("");
+	const [autoDraftEnabled, setAutoDraftEnabled] = useState(false);
 	const [isSaving, setIsSaving] = useState(false);
 
 	useEffect(() => {
 		if (mailbox) {
 			setDisplayName(mailbox.settings?.fromName || mailbox.name || "");
 			setAgentPrompt(mailbox.settings?.agentSystemPrompt || "");
+			setAutoDraftEnabled(mailbox.settings?.autoDraft?.enabled === true);
 		}
 	}, [mailbox]);
 
@@ -35,6 +37,7 @@ export default function SettingsRoute() {
 		const settings = {
 			...mailbox.settings,
 			fromName: displayName,
+			autoDraft: { enabled: autoDraftEnabled },
 			agentSystemPrompt: agentPrompt.trim() || undefined,
 		};
 		try {
@@ -81,6 +84,26 @@ export default function SettingsRoute() {
 							onChange={(e) => setDisplayName(e.target.value)}
 						/>
 						<Input label="Email" type="email" value={mailbox.email} disabled />
+					</div>
+				</div>
+
+				{/* Auto-draft */}
+				<div className="rounded-lg border border-kumo-line bg-kumo-base p-5">
+					<div className="flex items-center justify-between gap-4">
+						<div>
+							<div className="text-sm font-medium text-kumo-default">
+								Auto-draft replies
+							</div>
+							<p className="text-xs text-kumo-subtle mt-1">
+								When on, the AI agent drafts a reply to each new email in Drafts.
+								Drafts are never sent automatically.
+							</p>
+						</div>
+						<Switch
+							aria-label="Auto-draft replies"
+							checked={autoDraftEnabled}
+							onCheckedChange={setAutoDraftEnabled}
+						/>
 					</div>
 				</div>
 

@@ -23,7 +23,11 @@ export const emails = sqliteTable("emails", {
 	date: text("date"),
 	read: integer("read").default(0),
 	starred: integer("starred").default(0),
+	// Legacy pre-migration-9 column. Never read by new code; still written by
+	// createEmail as a transitional safety net so a rollback cannot blank new mail.
 	body: text("body"),
+	body_html: text("body_html"),
+	body_text: text("body_text"),
 	in_reply_to: text("in_reply_to"),
 	email_references: text("email_references"),
 	thread_id: text("thread_id"),

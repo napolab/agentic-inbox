@@ -26,6 +26,17 @@ interface EmailIframeProps {
  *   the opaque-origin sandbox cannot access anything useful.
  * - A strict CSP meta tag blocks external resource loads inside the
  *   iframe as a defense-in-depth layer.
+ *
+ * Link handling:
+ * - Every link/form opens in a new browser tab. `<base target="_blank">`
+ *   supplies the default target and DOMPurify strips any `target` the mail
+ *   itself carried, so no link can navigate the iframe (or the app) in place.
+ * - `allow-popups-to-escape-sandbox` is required: without it the new tab
+ *   inherits this iframe's sandbox and the destination site loads in an
+ *   opaque origin (broken cookies/storage/scripts).
+ * - Escaping the sandbox is why the injected script also sets
+ *   `rel="noopener noreferrer"`, cutting the `window.opener` handle that
+ *   would otherwise let the destination navigate this frame (tabnabbing).
  */
 export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 	const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -59,10 +70,11 @@ export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 		const iframe = iframeRef.current;
 		if (!iframe || !body) return;
 
+		// `target` is deliberately NOT allowed through: dropping it lets
+		// `<base target="_blank">` below decide the target for every link.
 		const cleanBody = DOMPurify.sanitize(body, {
 			USE_PROFILES: { html: true },
 			FORBID_TAGS: ["style"],
-			ADD_ATTR: ["target"],
 			FORCE_BODY: true,
 		});
 
@@ -84,6 +96,14 @@ export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 			<\/script>`
 			: "";
 
+		// `<base target="_blank">` already sends every click to a new tab; this
+		// only severs the `window.opener` back-reference on the opened tab.
+		const linkScript = `<script>
+				for (var i = 0, links = document.links; i < links.length; i++) {
+					links[i].rel = "noopener noreferrer";
+				}
+			<\/script>`;
+
 		// Use srcdoc so the iframe is truly sandboxed (no same-origin access).
 		// We can't use doc.write() because that requires allow-same-origin.
 		iframe.srcdoc = `<!DOCTYPE html>
@@ -92,6 +112,7 @@ export default function EmailIframe({ body, autoSize }: EmailIframeProps) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid: https:; script-src 'unsafe-inline';">
+<base target="_blank">
 <style>
 * { box-sizing: border-box; }
 html {
@@ -135,7 +156,7 @@ h1, h2, h3 { margin: 8px 0 4px; }
 ul, ol { padding-left: 20px; margin: 4px 0; }
 </style>
 </head>
-<body>${cleanBody}${heightScript}</body>
+<body>${cleanBody}${linkScript}${heightScript}</body>
 </html>`;
 	}, [body, autoSize]);
 
@@ -144,7 +165,7 @@ ul, ol { padding-left: 20px; margin: 4px 0; }
 			ref={iframeRef}
 			className="block w-full border-0"
 			style={autoSize ? { height: `${height}px` } : { height: "100%" }}
-			sandbox="allow-scripts allow-popups allow-top-navigation-by-user-activation"
+			sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
 			title="Email content"
 		/>
 	);

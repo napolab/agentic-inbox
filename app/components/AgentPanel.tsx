@@ -18,11 +18,12 @@ import {
 	StopIcon,
 	PencilSimpleIcon,
 } from "@phosphor-icons/react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "react-router";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useUIStore } from "~/hooks/useUIStore";
+import api from "~/services/api";
 import type { UIMessage } from "ai";
 
 const TOOL_LABELS: Record<string, { label: string; icon: React.ReactNode }> = {
@@ -103,11 +104,41 @@ function getToolNameFromPart(part: UIMessage["parts"][number]): string | null {
 	return null;
 }
 
-function hasDraftReplyTool(message: UIMessage): boolean {
+const DRAFT_TOOL_NAMES = ["draft_reply", "draft_email"];
+
+function hasDraftTool(message: UIMessage): boolean {
 	return message.parts.some((part) => {
 		const toolName = getToolNameFromPart(part);
-		return toolName === "draft_reply";
+		return toolName !== null && DRAFT_TOOL_NAMES.includes(toolName);
 	});
+}
+
+/**
+ * Draft id produced by a completed draft tool call.
+ *
+ * The AI SDK streams statically defined tools as parts typed `tool-<name>`
+ * carrying `state` and `output` — there is no `toolName`/`result` pair on them.
+ */
+function getDraftIdFromPart(part: UIMessage["parts"][number]): string | null {
+	const toolName = getToolNameFromPart(part);
+	if (toolName === null || !DRAFT_TOOL_NAMES.includes(toolName)) return null;
+
+	const { state, output } = part as { state?: string; output?: unknown };
+	if (state !== "output-available") return null;
+	if (typeof output !== "object" || output === null) return null;
+
+	const draftId = (output as { draftId?: unknown }).draftId;
+	if (typeof draftId !== "string" || draftId === "") return null;
+	return draftId;
+}
+
+/** Id of the newest draft the assistant saved in this message, if any. */
+function findLatestDraftId(message: UIMessage): string | null {
+	for (const part of [...message.parts].reverse()) {
+		const draftId = getDraftIdFromPart(part);
+		if (draftId !== null) return draftId;
+	}
+	return null;
 }
 
 function DraftActions({
@@ -134,14 +165,17 @@ function DraftActions({
 
 function MessageBubble({
 	message,
-	onAction,
+	onEditDraft,
 	isStreaming,
 }: {
 	message: UIMessage;
-	onAction?: (action: string) => void;
+	onEditDraft?: (message: UIMessage) => void;
 	isStreaming: boolean;
 }) {
 	const isUser = message.role === "user";
+	const handleEdit = useCallback(() => {
+		onEditDraft?.(message);
+	}, [onEditDraft, message]);
 
 	return (
 		<div
@@ -282,11 +316,8 @@ function MessageBubble({
 					return null;
 				})}
 				{/* Show action buttons for draft replies */}
-				{!isUser && hasDraftReplyTool(message) && onAction && (
-					<DraftActions
-						onEdit={() => onAction("edit")}
-						disabled={isStreaming}
-					/>
+				{!isUser && hasDraftTool(message) && onEditDraft && (
+					<DraftActions onEdit={handleEdit} disabled={isStreaming} />
 				)}
 			</div>
 		</div>
@@ -320,6 +351,34 @@ function AgentChatConnected({
 	useEffect(() => {
 		inputRef.current?.focus();
 	}, []);
+
+	/**
+	 * Open the saved draft in the composer.
+	 *
+	 * The tool output only echoes the raw plain-text body the model wrote, so
+	 * the stored row is fetched instead — it carries the real `body_html`
+	 * (including any quoted block) that the compose form expects.
+	 */
+	const handleEditDraft = useCallback(
+		async (message: UIMessage) => {
+			const draftId = findLatestDraftId(message);
+			if (!draftId) {
+				sendMessage({
+					text: "Let me edit this draft first. Show me what you have so I can modify it.",
+				});
+				return;
+			}
+			try {
+				const draft = await api.getEmail(mailboxId, draftId);
+				startCompose({ mode: "reply", originalEmail: null, draftEmail: draft });
+			} catch {
+				sendMessage({
+					text: "Let me edit this draft first. Show me what you have so I can modify it.",
+				});
+			}
+		},
+		[mailboxId, sendMessage, startCompose],
+	);
 
 	const handleSend = () => {
 		const text = inputValue.trim();
@@ -410,47 +469,7 @@ function AgentChatConnected({
 								key={msg.id}
 								message={msg}
 								isStreaming={isStreaming}
-							onAction={(action) => {
-								if (action === "edit") {
-										// Extract draft data from the draft_reply tool result
-										let draftData: {
-											to?: string;
-											subject?: string;
-											body?: string;
-											id?: string;
-										} | null = null;
-										for (const part of msg.parts) {
-											if (
-												(part as any).toolName === "draft_reply" &&
-												(part as any).result
-											) {
-												draftData = (part as any).result;
-												break;
-											}
-										}
-										if (draftData) {
-											const draftEmail = {
-												id: draftData.id || "",
-												subject: draftData.subject || "",
-												sender: mailboxId,
-												recipient: draftData.to || "",
-												date: new Date().toISOString(),
-												read: true,
-												starred: false,
-												body: draftData.body || "",
-											};
-											startCompose({
-												mode: "reply",
-												originalEmail: null,
-												draftEmail,
-											});
-										} else {
-											sendMessage({
-												text: "Let me edit this draft first. Show me what you have so I can modify it.",
-											});
-										}
-									}
-								}}
+								onEditDraft={handleEditDraft}
 							/>
 						))}
 						{isStreaming && (

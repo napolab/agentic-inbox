@@ -88,7 +88,7 @@ export default function SearchResultsRoute() {
 					) : (
 						<div>{results.map((email) => {
 							const isSelected = selectedEmailId === email.id;
-							const snippet = getSnippetText(email.snippet, 120);
+							const snippet = getSnippetText(email.snippet, 120, Boolean(email.snippet_is_html ?? 1));
 							const folderName = (email as Email & { folder_name?: string }).folder_name;
 							return (
 								<div key={email.id} role="button" tabIndex={0} onClick={() => handleRowClick(email)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleRowClick(email); } }} className={`group flex items-center gap-3 w-full text-left cursor-pointer transition-colors border-b border-kumo-line px-4 py-2.5 md:px-5 md:py-3 ${isPanelOpen ? "md:px-4 md:py-2.5" : ""} ${isSelected ? "bg-kumo-tint" : "hover:bg-kumo-tint"}`}>

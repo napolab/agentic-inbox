@@ -4,6 +4,7 @@
 
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
+import { getAgentByName } from "agents";
 import PostalMime from "postal-mime";
 import { z } from "zod";
 import { sendEmail } from "./email-sender";
@@ -15,11 +16,13 @@ import {
 	buildThreadingHeaders,
 	listMailboxes,
 } from "./lib/email-helpers";
-import { SendEmailRequestSchema } from "./lib/schemas";
+import { SendEmailRequestSchema, PushSubscriptionSchema } from "./lib/schemas";
+import { notifyNewEmail } from "./notifiers";
 import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
+import { deriveBodyText } from "../shared/body-parts";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
-import { requireMailbox, type MailboxContext } from "./lib/mailbox";
+import { ensureMailboxExists, isAutoDraftEnabled, requireMailbox, type MailboxContext } from "./lib/mailbox";
 
 type AppContext = Context<MailboxContext>;
 
@@ -90,6 +93,31 @@ app.get("/api/v1/config", (c) => {
 	const domains = domainsRaw.split(",").map((d) => d.trim()).filter(Boolean);
 	const emailAddresses = c.env.EMAIL_ADDRESSES ?? [];
 	return c.json({ domains, emailAddresses });
+});
+
+// -- Push notification subscriptions (device-global, not per-mailbox) ----
+
+app.get("/api/v1/push/vapid-public-key", (c) => {
+	const publicKey = c.env.VAPID_PUBLIC_KEY;
+	if (!publicKey) return c.json({ error: "Push notifications are not configured" }, 503);
+	return c.json({ publicKey });
+});
+
+app.put("/api/v1/push/subscriptions", async (c) => {
+	const body: unknown = await c.req.json().catch(() => null);
+	const parsed = PushSubscriptionSchema.safeParse(body);
+	if (!parsed.success) return c.json({ error: "Invalid push subscription" }, 400);
+	const store = c.env.PUSH_SUBSCRIPTIONS.get(c.env.PUSH_SUBSCRIPTIONS.idFromName("global"));
+	await store.upsert(parsed.data);
+	return c.body(null, 204);
+});
+
+app.delete("/api/v1/push/subscriptions", async (c) => {
+	const endpoint = c.req.query("endpoint");
+	if (!endpoint) return c.json({ error: "endpoint query parameter is required" }, 400);
+	const store = c.env.PUSH_SUBSCRIPTIONS.get(c.env.PUSH_SUBSCRIPTIONS.idFromName("global"));
+	await store.remove(endpoint);
+	return c.body(null, 204);
 });
 
 // -- Mailboxes ------------------------------------------------------
@@ -188,7 +216,7 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 		id: messageId, subject, sender: fromEmail, recipient: toStr,
 		cc: cc ? (Array.isArray(cc) ? cc.join(", ") : cc).toLowerCase() : null,
 		bcc: bcc ? (Array.isArray(bcc) ? bcc.join(", ") : bcc).toLowerCase() : null,
-		date: new Date().toISOString(), body: html || text || "",
+		date: new Date().toISOString(), body_html: html || null, body_text: text || null,
 		in_reply_to: in_reply_to || null, email_references: references ? JSON.stringify(references) : null,
 		thread_id: thread_id || in_reply_to || messageId, message_id: outgoingMessageId,
 		raw_headers: JSON.stringify([
@@ -206,7 +234,9 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 			to, cc, bcc, from, subject, html, text,
 			attachments: attachments?.map((att) => ({ content: att.content, filename: att.filename, type: att.type, disposition: att.disposition || "attachment", contentId: att.contentId })),
 			...(in_reply_to ? { headers: buildThreadingHeaders(in_reply_to, references || []) } : {}),
-		}).catch((e) => console.error("Deferred email delivery failed:", (e as Error).message)),
+		})
+			.then(({ messageId: delivered }) => stub.setDeliveredMessageId(messageId, delivered))
+			.catch((e) => console.error("Deferred email delivery failed:", (e as Error).message)),
 	);
 	return c.json({ id: messageId, status: "sent" }, 202);
 });
@@ -221,7 +251,7 @@ app.post("/api/v1/mailboxes/:mailboxId/drafts", async (c: AppContext) => {
 	await stub.createEmail(Folders.DRAFT, {
 		id: messageId, subject: subject || "", sender: mailboxId.toLowerCase(),
 		recipient: (to || "").toLowerCase(), cc: cc?.toLowerCase() || null, bcc: bcc?.toLowerCase() || null,
-		date: now, body, in_reply_to: in_reply_to || null, email_references: null,
+		date: now, body_html: body || null, body_text: null, in_reply_to: in_reply_to || null, email_references: null,
 		thread_id: thread_id || in_reply_to || messageId,
 	}, []);
 	return c.json({ id: messageId, status: "draft", subject: subject || "", recipient: to || "", date: now }, 201);
@@ -345,26 +375,44 @@ async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	return result;
 }
 
-async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env: Env, ctx: ExecutionContext) {
+async function receiveEmail(event: { raw: ReadableStream; rawSize: number; to?: string }, env: Env, ctx: ExecutionContext) {
 	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
 	const parsedEmail = await new PostalMime().parse(rawEmail);
 
-	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
+	const envelopeTo = event.to?.toLowerCase();
+
+	if ((!parsedEmail.to?.length || !parsedEmail.to[0].address) && !envelopeTo) throw new Error("received email with empty to");
 
 	const allowedAddresses = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
-	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
+	const allRecipients = (parsedEmail.to || []).map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
 	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 
+	const domains = (env.DOMAINS || "").split(",").map((d) => d.trim().toLowerCase()).filter(Boolean);
+	const inOwnDomain = (addr: string) => domains.some((d) => addr.endsWith(`@${d}`));
+
+	const isString = (addr: string | undefined): addr is string => Boolean(addr);
+
 	let mailboxId: string | undefined;
 	if (allowedAddresses.length > 0) {
-		mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
+		mailboxId = [envelopeTo, ...allRecipients].filter(isString).find((addr) => allowedAddresses.includes(addr));
 		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
-	} else { mailboxId = allRecipients[0]; }
+	} else {
+		// Catch-all mode: the envelope recipient (SMTP RCPT TO) is authoritative and
+		// spoof-proof, so it's tried first; header-derived recipients are the fallback
+		// for cases where the envelope isn't available (e.g. local dev/testing).
+		mailboxId = [envelopeTo, ...allRecipients, ...ccRecipients, ...bccRecipients].filter(isString).find(inOwnDomain) ?? allRecipients[0] ?? envelopeTo;
+	}
 	if (!mailboxId) throw new Error("received email with no valid recipient address");
 
 	const messageId = crypto.randomUUID();
-	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
+	if (allowedAddresses.length === 0 && inOwnDomain(mailboxId)) {
+		// Catch-all mode: mailboxes appear on first contact.
+		await ensureMailboxExists(env, mailboxId);
+	} else if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) {
+		console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`);
+		return;
+	}
 
 	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
 
@@ -394,19 +442,52 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 
 	await stub.createEmail(Folders.INBOX, {
 		id: messageId, subject: parsedEmail.subject || "",
-		sender: (parsedEmail.from?.address || "").toLowerCase(), recipient: allRecipients.join(", "),
+		sender: (parsedEmail.from?.address || "").toLowerCase(),
+		recipient: allRecipients.length ? allRecipients.join(", ") : (envelopeTo ?? ""),
 		cc: ccRecipients.join(", ") || null, bcc: bccRecipients.join(", ") || null,
 		date: new Date().toISOString(), // uses receive time, not the email's Date header
-		body: parsedEmail.html || parsedEmail.text || "",
+		body_html: parsedEmail.html || null,
+		body_text: parsedEmail.text || null,
 		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
 		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
 	}, attachmentData);
 
-	const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
-	ctx.waitUntil(agentStub.fetch(new Request("https://agents/onNewEmail", {
-		method: "POST", headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
-	})).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
+	// Webhook notifications are best-effort: they run after the email is safely
+	// stored, and a dead webhook must never cost us the message.
+	const runNewEmailNotifications = async () => {
+		const failures = await notifyNewEmail(env, {
+			mailboxId,
+			emailId: messageId,
+			sender: (parsedEmail.from?.address || "").toLowerCase(),
+			subject: parsedEmail.subject || "",
+			snippet: deriveBodyText({ body_html: parsedEmail.html ?? null, body_text: parsedEmail.text ?? null }),
+			receivedAt: new Date().toISOString(),
+		});
+		for (const failure of failures) {
+			console.error(`New-email notification via ${failure.type} failed: ${failure.reason}`);
+		}
+	};
+	ctx.waitUntil(runNewEmailNotifications());
+
+	// Auto-draft is opt-in per mailbox (settings.autoDraft.enabled). Failing to
+	// read settings counts as disabled: mail storage must never depend on this.
+	const readAutoDraftEnabled = async () => {
+		try {
+			const settingsObject = await env.BUCKET.get(`mailboxes/${mailboxId}.json`);
+			if (!settingsObject) return false;
+			return isAutoDraftEnabled(await settingsObject.json());
+		} catch (e) {
+			console.warn("Auto-draft skipped: could not read mailbox settings:", (e as Error).message);
+			return false;
+		}
+	};
+
+	if (await readAutoDraftEnabled()) {
+		ctx.waitUntil(getAgentByName(env.EMAIL_AGENT, mailboxId).then((agentStub) => agentStub.fetch(new Request("https://agents/onNewEmail", {
+			method: "POST", headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
+		}))).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
+	}
 }
 
 export { app, receiveEmail };

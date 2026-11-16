@@ -9,6 +9,7 @@
  *
  * See: https://developers.cloudflare.com/email-service/api/send-emails/workers-api/
  */
+import { base64ToBytes } from "./lib/attachments";
 
 export interface SendEmailParams {
 	to: string | string[];
@@ -30,11 +31,19 @@ export interface SendEmailParams {
 }
 
 /**
+ * The binding assigns its own Message-ID (a caller-set one is rejected with
+ * E_HEADER_NOT_ALLOWED) and returns it in angle brackets. Strip them to match
+ * how `message_id` is stored, so replies can reference the delivered ID.
+ */
+export const bareMessageId = (headerValue: string): string =>
+	headerValue.trim().replace(/^<(.*)>$/, "$1");
+
+/**
  * Send an email using the Cloudflare Email Service binding.
  *
  * @param binding  - The `EMAIL` SendEmail binding from env
  * @param params   - Email parameters (to, from, subject, body, etc.)
- * @returns The send result with messageId
+ * @returns The Message-ID recipients see, without angle brackets
  * @throws On validation or delivery errors (error has `.code` property)
  */
 export async function sendEmail(
@@ -58,8 +67,11 @@ export async function sendEmail(
 	}
 
 	if (params.attachments && params.attachments.length > 0) {
+		// The binding sends a string `content` as literal text (wrapped in
+		// quoted-printable), so base64 must be decoded here or the recipient
+		// receives the base64 characters instead of the file.
 		message.attachments = params.attachments.map((att) => ({
-			content: att.content,
+			content: base64ToBytes(att.content),
 			filename: att.filename,
 			type: att.type,
 			disposition: att.disposition,
@@ -68,5 +80,5 @@ export async function sendEmail(
 	}
 
 	const result = await binding.send(message as any);
-	return { messageId: result.messageId };
+	return { messageId: bareMessageId(result.messageId) };
 }

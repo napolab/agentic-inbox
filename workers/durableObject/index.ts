@@ -9,7 +9,10 @@ import type { SQL } from "drizzle-orm";
 import * as schema from "../db/schema";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
-import { applyMigrations, mailboxMigrations } from "./migrations";
+import { buildAfterCondition, type SearchAfter } from "../lib/all-inbox";
+import { replaceMessageIdHeader } from "../lib/email-helpers";
+import { applyMigrations, backfillBodyParts, mailboxMigrations } from "./migrations";
+import { SEND_RATE_LIMITS, SENT_SINCE_COUNT_SQL, THREAD_LOOKBACK_MS, isoSince } from "./time-windows";
 
 /**
  * SQL expression to normalize email subjects by stripping common
@@ -57,6 +60,8 @@ interface SearchFilterOptions {
 	subject?: string;
 	date_start?: string;
 	date_end?: string;
+	/** Keyset position: only rows strictly after it in (date DESC, id ASC) order. */
+	after?: SearchAfter;
 	is_read?: boolean;
 	is_starred?: boolean;
 	has_attachment?: boolean;
@@ -79,7 +84,10 @@ interface EmailData {
 	cc?: string | null;
 	bcc?: string | null;
 	date: string;
-	body: string;
+	/** HTML MIME part; null when the message has no HTML version. */
+	body_html: string | null;
+	/** Plain-text MIME part; null when the message has no text version. */
+	body_text: string | null;
 	read?: boolean;
 	starred?: boolean;
 	in_reply_to?: string | null;
@@ -107,6 +115,9 @@ export class MailboxDO extends DurableObject<Env> {
 		super(state, env);
 		this.db = drizzle(this.ctx.storage, { schema });
 		applyMigrations(this.ctx.storage.sql, mailboxMigrations, this.ctx.storage);
+		// Chunked and resumable, so an interrupted constructor picks up where
+		// it stopped instead of retrying one oversized transaction forever.
+		backfillBodyParts(this.ctx.storage.sql, this.ctx.storage);
 	}
 
 	// ── Email CRUD (Drizzle) ───────────────────────────────────────
@@ -160,7 +171,9 @@ export class MailboxDO extends DurableObject<Env> {
 				email_references: schema.emails.email_references,
 				thread_id: schema.emails.thread_id,
 				folder_id: schema.emails.folder_id,
-				snippet: sql<string>`SUBSTR(${schema.emails.body}, 1, 300)`,
+				snippet: sql<string>`SUBSTR(COALESCE(${schema.emails.body_html}, ${schema.emails.body_text}), 1, 300)`,
+				// Tells the client whether the snippet needs HTML stripping.
+				snippet_is_html: sql<number>`(${schema.emails.body_html} IS NOT NULL)`,
 			})
 			.from(schema.emails)
 			.where(conditions.length > 0 ? and(...conditions) : undefined)
@@ -267,7 +280,8 @@ export class MailboxDO extends DurableObject<Env> {
 					lp.id, lp.subject, lp.sender, lp.recipient, lp.date,
 					lp.read, lp.starred, lp.thread_id, lp.folder_id,
 					lp.in_reply_to, lp.email_references,
-					SUBSTR(lp.body, 1, 300) as snippet,
+					SUBSTR(COALESCE(lp.body_html, lp.body_text), 1, 300) as snippet,
+					(lp.body_html IS NOT NULL) as snippet_is_html,
 					ds.thread_count, ds.thread_unread_count, ds.participants
 				FROM latest_per_group lp
 				JOIN draft_stats ds ON lp.draft_group_key = ds.draft_group_key
@@ -355,7 +369,8 @@ export class MailboxDO extends DurableObject<Env> {
 				lif.id, lif.subject, lif.sender, lif.recipient, lif.date,
 				lif.read, lif.starred, lif.thread_id, lif.folder_id,
 				lif.in_reply_to, lif.email_references,
-				SUBSTR(lif.body, 1, 300) as snippet,
+				SUBSTR(COALESCE(lif.body_html, lif.body_text), 1, 300) as snippet,
+				(lif.body_html IS NOT NULL) as snippet_is_html,
 				cs.thread_count, cs.thread_unread_count, cs.participants,
 				CASE WHEN lmc.folder_id != (SELECT id FROM folders WHERE name = 'sent' LIMIT 1)
 					AND lmc.folder_id != (SELECT id FROM folders WHERE name = 'draft' LIMIT 1)
@@ -451,8 +466,13 @@ export class MailboxDO extends DurableObject<Env> {
 			.where(eq(schema.attachments.email_id, id))
 			.all();
 
+		// The legacy `body` column stays in the DB (rollback safety) but must
+		// never reach API/MCP/agent consumers -- they'd see a duplicate of the
+		// real body, or a stray `"body": null`, and might read the wrong one.
+		const { body: _legacyBody, ...emailWithoutLegacyBody } = email;
+
 		return {
-			...email,
+			...emailWithoutLegacyBody,
 			read: !!email.read,
 			starred: !!email.starred,
 			attachments: emailAttachments,
@@ -493,12 +513,16 @@ export class MailboxDO extends DurableObject<Env> {
 			attachmentsByEmail.set(att.email_id, list);
 		}
 
-		return emailRows.map((email) => ({
-			...email,
-			read: !!email.read,
-			starred: !!email.starred,
-			attachments: attachmentsByEmail.get(email.id) || [],
-		}));
+		return emailRows.map((email) => {
+			// Same as getEmail: keep the legacy `body` column out of the payload.
+			const { body: _legacyBody, ...emailWithoutLegacyBody } = email;
+			return {
+				...emailWithoutLegacyBody,
+				read: !!email.read,
+				starred: !!email.starred,
+				attachments: attachmentsByEmail.get(email.id) || [],
+			};
+		});
 	}
 
 	async updateEmail(
@@ -658,8 +682,17 @@ export class MailboxDO extends DurableObject<Env> {
 	#buildSearchConditions(
 		options: SearchFilterOptions,
 		tableAlias = "",
-	): { conditions: string[]; params: (string | number)[] } {
-		const { query, folder, from, to, subject, date_start, date_end, is_read, is_starred, has_attachment } = options;
+	): {
+		conditions: string[];
+		params: (string | number)[];
+		/**
+		 * Placeholder holding the body LIKE pattern (`?N`), present only when a
+		 * text query was given. Callers reuse it to pick the snippet from the
+		 * column that actually matched — SQLite `?N` params are reusable.
+		 */
+		bodyLikeParam?: string;
+	} {
+		const { query, folder, from, to, subject, date_start, date_end, after, is_read, is_starred, has_attachment } = options;
 		const prefix = tableAlias ? `${tableAlias}.` : "";
 		const conditions: string[] = [];
 		const params: (string | number)[] = [];
@@ -671,12 +704,19 @@ export class MailboxDO extends DurableObject<Env> {
 			return `?${paramIdx}`;
 		};
 
-		if (query) {
-			const p1 = addParam(`%${query}%`);
-			const p2 = addParam(`%${query}%`);
-			const p3 = addParam(`%${query}%`);
-			const p4 = addParam(`%${query}%`);
-			conditions.push(`(${prefix}subject LIKE ${p1} OR ${prefix}body LIKE ${p2} OR ${prefix}sender LIKE ${p3} OR ${prefix}recipient LIKE ${p4} OR ${prefix}cc LIKE ${p4} OR ${prefix}bcc LIKE ${p4})`);
+		// Allocated together (left-to-right) so the placeholder numbering is
+		// stable and `p2` can be handed back to the caller for the snippet.
+		const queryParams = query
+			? {
+					p1: addParam(`%${query}%`),
+					p2: addParam(`%${query}%`),
+					p3: addParam(`%${query}%`),
+					p4: addParam(`%${query}%`),
+				}
+			: null;
+		if (queryParams) {
+			const { p1, p2, p3, p4 } = queryParams;
+			conditions.push(`(${prefix}subject LIKE ${p1} OR (${prefix}body_html LIKE ${p2} OR ${prefix}body_text LIKE ${p2}) OR ${prefix}sender LIKE ${p3} OR ${prefix}recipient LIKE ${p4} OR ${prefix}cc LIKE ${p4} OR ${prefix}bcc LIKE ${p4})`);
 		}
 		if (folder) {
 			const p = addParam(folder);
@@ -687,17 +727,44 @@ export class MailboxDO extends DurableObject<Env> {
 		if (subject) { const p = addParam(`%${subject}%`); conditions.push(`${prefix}subject LIKE ${p}`); }
 		if (date_start) { const p = addParam(date_start); conditions.push(`${prefix}date >= ${p}`); }
 		if (date_end) { const p = addParam(date_end); conditions.push(`${prefix}date <= ${p}`); }
+		// Assumes emails.date is never NULL for inbox rows (all write paths use
+		// toISOString); NULL-date rows would be excluded by any `after` predicate.
+		if (after) conditions.push(buildAfterCondition(after, prefix, addParam));
 		if (is_read !== undefined) { const p = addParam(is_read ? 1 : 0); conditions.push(`${prefix}read = ${p}`); }
 		if (is_starred !== undefined) { const p = addParam(is_starred ? 1 : 0); conditions.push(`${prefix}starred = ${p}`); }
 		if (has_attachment) { conditions.push(`${prefix}id IN (SELECT DISTINCT email_id FROM attachments)`); }
 
-		return { conditions, params };
+		return { conditions, params, bodyLikeParam: queryParams?.p2 };
+	}
+
+	/**
+	 * Snippet columns for search results.
+	 *
+	 * With a text query the snippet must come from the column that actually
+	 * matched — otherwise searching for text that only appears in the plain
+	 * part shows an HTML snippet with no visible match (and vice versa).
+	 */
+	#buildSearchSnippetSql(bodyLikeParam?: string): string {
+		if (!bodyLikeParam) {
+			return `SUBSTR(COALESCE(e.body_html, e.body_text), 1, 300) as snippet,
+				(e.body_html IS NOT NULL) as snippet_is_html`;
+		}
+		return `SUBSTR(CASE
+					WHEN e.body_html LIKE ${bodyLikeParam} THEN e.body_html
+					WHEN e.body_text LIKE ${bodyLikeParam} THEN e.body_text
+					ELSE COALESCE(e.body_html, e.body_text)
+				END, 1, 300) as snippet,
+				CASE
+					WHEN e.body_html LIKE ${bodyLikeParam} THEN 1
+					WHEN e.body_text LIKE ${bodyLikeParam} THEN 0
+					ELSE (e.body_html IS NOT NULL)
+				END as snippet_is_html`;
 	}
 
 	async searchEmails(options: SearchFilterOptions & { page?: number; limit?: number }) {
 		const { page = 1, limit: rawLimit = 25 } = options;
 		const limit = Math.min(Math.max(rawLimit, 1), 100);
-		const { conditions, params } = this.#buildSearchConditions(options, "e");
+		const { conditions, params, bodyLikeParam } = this.#buildSearchConditions(options, "e");
 
 		const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 		const offset = (page - 1) * limit;
@@ -706,12 +773,12 @@ export class MailboxDO extends DurableObject<Env> {
 			SELECT e.id, e.subject, e.sender, e.recipient, e.cc, e.bcc, e.date,
 				e.read, e.starred, e.in_reply_to, e.email_references,
 				e.thread_id, e.folder_id,
-				SUBSTR(e.body, 1, 300) as snippet,
+				${this.#buildSearchSnippetSql(bodyLikeParam)},
 				f.name as folder_name
 			FROM emails e
 			LEFT JOIN folders f ON e.folder_id = f.id
 			${where}
-			ORDER BY e.date DESC LIMIT ?${params.length + 1} OFFSET ?${params.length + 2}`;
+			ORDER BY e.date DESC, e.id ASC LIMIT ?${params.length + 1} OFFSET ?${params.length + 2}`;
 		params.push(limit, offset);
 
 		const result = this.ctx.storage.sql.exec(query, ...params);
@@ -754,10 +821,11 @@ export class MailboxDO extends DurableObject<Env> {
 			 FROM emails
 			 WHERE thread_id IS NOT NULL
 			   AND thread_id != id
-			   AND date >= datetime('now', '-7 days')
+			   AND date >= ?1
 			 GROUP BY thread_id
 			 ORDER BY MAX(date) DESC
 			 LIMIT 50`,
+			isoSince(Date.now(), THREAD_LOOKBACK_MS),
 		);
 
 		const normalizedSender = senderAddress?.toLowerCase().trim();
@@ -783,34 +851,58 @@ export class MailboxDO extends DurableObject<Env> {
 		return null;
 	}
 
+	/** Look up an email by its RFC822 Message-ID. Used by the import endpoint to dedupe. */
+	async findEmailByMessageId(messageId: string): Promise<string | null> {
+		const row = this.db
+			.select({ id: schema.emails.id })
+			.from(schema.emails)
+			.where(eq(schema.emails.message_id, messageId))
+			.limit(1)
+			.get();
+		return row?.id ?? null;
+	}
+
+	/**
+	 * Replace a Sent email's provisional Message-ID with the one the send
+	 * binding delivered. Routes that store before sending (202 + waitUntil)
+	 * only learn the real ID afterwards; replies reference it, so threading
+	 * breaks unless it is stored.
+	 */
+	async setDeliveredMessageId(id: string, messageId: string) {
+		const row = this.db
+			.select({ raw_headers: schema.emails.raw_headers })
+			.from(schema.emails)
+			.where(eq(schema.emails.id, id))
+			.get();
+		if (!row) return;
+		this.db
+			.update(schema.emails)
+			.set({ message_id: messageId, raw_headers: replaceMessageIdHeader(row.raw_headers, messageId) })
+			.where(eq(schema.emails.id, id))
+			.run();
+	}
+
 	// ── Rate limiting (raw SQL) ────────────────────────────────────
 
 	/**
 	 * Check if the mailbox has exceeded the send rate limit.
 	 * Limits: 20 emails per hour, 100 per day per mailbox.
 	 * Returns null if under limit, or an error message string if exceeded.
+	 *
+	 * Window starts are bound as ISO strings rather than computed with
+	 * `datetime('now', ...)` -- see the note in ./time-windows.
 	 */
 	async checkSendRateLimit(): Promise<string | null> {
-		const hourRow = [...this.ctx.storage.sql.exec(
-			`SELECT COUNT(*) as cnt FROM emails
-			 WHERE folder_id = ?1
-			   AND date >= datetime('now', '-1 hour')`,
-			Folders.SENT,
-		)][0] as { cnt: number } | undefined;
+		const now = Date.now();
 
-		if ((hourRow?.cnt ?? 0) >= 20) {
-			return "Rate limit exceeded: max 20 emails per hour per mailbox";
-		}
+		for (const limit of SEND_RATE_LIMITS) {
+			const row = [...this.ctx.storage.sql.exec(
+				SENT_SINCE_COUNT_SQL,
+				Folders.SENT,
+				isoSince(now, limit.windowMs),
+			)][0] as { cnt: number } | undefined;
 
-		const dayRow = [...this.ctx.storage.sql.exec(
-			`SELECT COUNT(*) as cnt FROM emails
-			 WHERE folder_id = ?1
-			   AND date >= datetime('now', '-1 day')`,
-			Folders.SENT,
-		)][0] as { cnt: number } | undefined;
-
-		if ((dayRow?.cnt ?? 0) >= 100) {
-			return "Rate limit exceeded: max 100 emails per day per mailbox";
+			if ((row?.cnt ?? 0) >= limit.max) return limit.message;
 		}
 
 		return null;
@@ -856,7 +948,12 @@ export class MailboxDO extends DurableObject<Env> {
 				date: email.date,
 				read: isSent ? 1 : (email.read ? 1 : 0),
 				starred: email.starred ? 1 : 0,
-				body: email.body,
+				body_html: email.body_html,
+				body_text: email.body_text,
+				// Transitional dual-write so reverting this release cannot blank
+				// new mail; remove once the body-parts schema has settled in
+				// production.
+				body: email.body_html ?? email.body_text ?? null,
 				in_reply_to: email.in_reply_to ?? null,
 				email_references: email.email_references ?? null,
 				thread_id: email.thread_id ?? null,

@@ -168,4 +168,111 @@ export const mailboxMigrations: Migration[] = [
             CREATE INDEX IF NOT EXISTS idx_emails_folder_date ON emails(folder_id, date DESC);
         `,
 	},
+	{
+		// Store the two MIME parts separately. body_html = HTML part,
+		// body_text = plain-text part; either may be NULL. Schema change only:
+		// copying the legacy single-column `body` into them happens in
+		// backfillBodyParts(), chunked and resumable, because a large mailbox
+		// would blow the DO's transaction budget here and roll back forever.
+		name: "9_add_body_parts",
+		sql: txn(`
+            ALTER TABLE emails ADD COLUMN body_html TEXT;
+            ALTER TABLE emails ADD COLUMN body_text TEXT;
+        `),
+	},
 ];
+
+// ── Legacy body backfill (chunked, resumable) ──────────────────────
+
+/** Marker row in d1_migrations; its presence means the backfill is complete. */
+const BACKFILL_MIGRATION_NAME = "9b_backfill_body_parts";
+
+/**
+ * A legacy row still awaiting classification: it has a `body` and neither
+ * part has been filled in yet. Both chunk statements narrow this same
+ * predicate, so a row can only ever be claimed once.
+ */
+const UNCLASSIFIED_PREDICATE = `body IS NOT NULL AND body_html IS NULL AND body_text IS NULL`;
+
+/**
+ * Rows whose legacy `body` is HTML: the GLOB is ≈ /<[a-z]/i followed by '>'.
+ * Drafts are exempt from the GLOB — drafts were always authored as HTML
+ * (compose editor / agent tools) and draft edit/send/update read only
+ * body_html, so a tagless fragment like 'hello' must not fall into body_text
+ * where those flows would see an empty draft and overwrite it.
+ */
+const HTML_CLASSIFIER = `(folder_id = 'draft' OR body GLOB '*<[A-Za-z]*>*')`;
+
+/** Rows copied into body_html, one chunk at a time. */
+export const BACKFILL_HTML_CHUNK_SQL = `UPDATE emails SET body_html = body WHERE rowid IN (
+	SELECT rowid FROM emails
+	WHERE ${UNCLASSIFIED_PREDICATE}
+		AND ${HTML_CLASSIFIER}
+	LIMIT 1000)`;
+
+/**
+ * Rows copied into body_text. The classifier is negated rather than relying
+ * on "body_html IS NULL after the html pass": the two statements run in
+ * separate chunks, so a later html chunk must not find its rows already
+ * claimed by an earlier text chunk.
+ */
+export const BACKFILL_TEXT_CHUNK_SQL = `UPDATE emails SET body_text = body WHERE rowid IN (
+	SELECT rowid FROM emails
+	WHERE ${UNCLASSIFIED_PREDICATE}
+		AND NOT ${HTML_CLASSIFIER}
+	LIMIT 1000)`;
+
+const COUNT_UNCLASSIFIED_SQL = `SELECT COUNT(*) as remaining FROM emails WHERE ${UNCLASSIFIED_PREDICATE}`;
+
+/**
+ * Copy legacy single-column `body` values into body_html / body_text.
+ *
+ * Runs outside the migration runner and outside any single transaction: each
+ * chunk commits on its own, so a constructor that dies mid-backfill resumes
+ * where it left off on the next request instead of retrying a monolithic
+ * transaction that can never fit in the DO's budget.
+ *
+ * Once every row is classified, a marker row is written to d1_migrations so
+ * later constructors exit after a single SELECT.
+ */
+export function backfillBodyParts(
+	sql: SqlStorage,
+	storage?: DurableObjectStorage,
+): void {
+	const done = [
+		...sql.exec(`SELECT 1 FROM d1_migrations WHERE name = ?`, BACKFILL_MIGRATION_NAME),
+	];
+	if (done.length > 0) return;
+
+	const countRemaining = (): number => {
+		const row = [...sql.exec(COUNT_UNCLASSIFIED_SQL)][0] as
+			| { remaining: number }
+			| undefined;
+		return row?.remaining ?? 0;
+	};
+
+	const runChunk = () => {
+		sql.exec(BACKFILL_HTML_CHUNK_SQL);
+		sql.exec(BACKFILL_TEXT_CHUNK_SQL);
+	};
+
+	for (;;) {
+		const remaining = countRemaining();
+		if (remaining === 0) break;
+
+		if (storage) {
+			// Preferred: one committed chunk per transaction via the DO JS API
+			storage.transactionSync(runChunk);
+		} else {
+			// Fallback: run without explicit transaction (each exec auto-commits)
+			runChunk();
+		}
+
+		// No progress means the leftovers match neither classifier (only
+		// possible with a NULL folder_id, which the schema forbids). Stop
+		// rather than spin forever — retrying would never classify them.
+		if (countRemaining() >= remaining) break;
+	}
+
+	sql.exec(`INSERT INTO d1_migrations (name) VALUES (?)`, BACKFILL_MIGRATION_NAME);
+}

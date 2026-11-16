@@ -4,6 +4,7 @@
 
 import EmailAttachmentList from "~/components/EmailAttachmentList";
 import EmailIframe from "~/components/EmailIframe";
+import { plainTextToHtml } from "~/lib/email-content";
 import { formatDetailDate, rewriteInlineImages } from "~/lib/utils";
 import type { Email } from "~/types";
 
@@ -18,6 +19,9 @@ export default function SingleMessageView({
 	mailboxId,
 	onPreviewImage,
 }: SingleMessageViewProps) {
+	const bodyHtml =
+		email.body_html ?? plainTextToHtml(email.body_text ?? "");
+
 	return (
 		<div className="flex flex-col h-full">
 			<div className="px-4 py-4 border-b border-kumo-line md:px-6">
@@ -42,7 +46,7 @@ export default function SingleMessageView({
 			<div className="flex-1 min-h-0">
 				<EmailIframe
 					body={rewriteInlineImages(
-						email.body || "",
+						bodyHtml,
 						mailboxId || "",
 						email.id,
 						email.attachments,

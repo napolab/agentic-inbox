@@ -161,6 +161,14 @@ export async function verifyDraft(ai: Ai, body: string): Promise<string> {
 			return body;
 		}
 
+		// The verifier may only delete lines. Llama sometimes adds its own
+		// commentary ("No system artifacts found in the email.") or rephrases;
+		// either would be saved into the draft, so keep the original instead.
+		if (!onlyRemovesLines(replyText, cleanedTrimmed)) {
+			console.warn("Draft verifier added or rewrote text, falling back to original.");
+			return body;
+		}
+
 		// Safety check: if the AI removed more than 50% of the content,
 		// it's probably being too aggressive — fall back to original.
 		// This threshold balances between catching real artifacts and
@@ -190,4 +198,23 @@ export async function verifyDraft(ai: Ai, body: string): Promise<string> {
 
 function normalizeWhitespace(s: string): string {
 	return s.replace(/\s+/g, " ").trim();
+}
+
+function contentLines(s: string): string[] {
+	return s.split("\n").map(normalizeWhitespace).filter((line) => line !== "");
+}
+
+/**
+ * True when every non-blank line of `cleaned` appears in `original`, in
+ * order — i.e. `cleaned` is `original` with some lines deleted (whitespace
+ * differences ignored). Anything added or reworded makes this false.
+ */
+function onlyRemovesLines(original: string, cleaned: string): boolean {
+	const originalLines = contentLines(original);
+	const matched = contentLines(cleaned).reduce<number | null>((from, line) => {
+		if (from === null) return null;
+		const at = originalLines.indexOf(line, from);
+		return at === -1 ? null : at + 1;
+	}, 0);
+	return matched !== null;
 }

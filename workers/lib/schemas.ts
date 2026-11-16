@@ -29,10 +29,19 @@ export interface EmailMetadata {
 	thread_id?: string | null;
 	folder_id?: string | null;
 	snippet?: string | null;
+	/**
+	 * 1 when `snippet` was taken from the HTML part (so it still contains
+	 * markup and must be stripped before display), 0 when it came from the
+	 * plain-text part.
+	 */
+	snippet_is_html?: number;
 }
 
 export interface EmailFull extends EmailMetadata {
-	body?: string | null;
+	/** HTML MIME part; null/absent when the message has no HTML version. */
+	body_html?: string | null;
+	/** Plain-text MIME part; null/absent when the message has no text version. */
+	body_text?: string | null;
 	message_id?: string | null;
 	raw_headers?: string | null;
 	attachments?: AttachmentInfo[];
@@ -92,4 +101,13 @@ export const SendEmailRequestSchema = z
 export const SendEmailResponseSchema = z.object({
 	id: z.string(),
 	status: z.string(),
+});
+
+/** PushSubscriptionJSON from pushManager.subscribe().toJSON(). Extra fields (expirationTime) pass through. */
+export const PushSubscriptionSchema = z.object({
+	endpoint: z.string().url().startsWith("https://"),
+	keys: z.object({
+		p256dh: z.string().min(1).regex(/^[A-Za-z0-9_-]+$/),
+		auth: z.string().min(1).regex(/^[A-Za-z0-9_-]+$/),
+	}),
 });

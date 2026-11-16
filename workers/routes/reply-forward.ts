@@ -65,7 +65,8 @@ export async function handleReplyEmail(c: AppContext) {
 			cc: cc ? (Array.isArray(cc) ? cc.join(", ") : cc).toLowerCase() : null,
 			bcc: bcc ? (Array.isArray(bcc) ? bcc.join(", ") : bcc).toLowerCase() : null,
 			date: new Date().toISOString(),
-			body: html || text || "",
+			body_html: html || null,
+			body_text: text || null,
 			in_reply_to: originalMsgId,
 			email_references: JSON.stringify(references),
 			thread_id: thread_id,
@@ -104,7 +105,9 @@ export async function handleReplyEmail(c: AppContext) {
 				contentId: att.contentId,
 			})),
 			headers: buildThreadingHeaders(originalMsgId, references),
-		}).catch((e) => {
+		})
+			.then(({ messageId: delivered }) => stub.setDeliveredMessageId(messageId, delivered))
+			.catch((e) => {
 			console.error("Deferred reply delivery failed:", (e as Error).message);
 		}),
 	);
@@ -155,7 +158,8 @@ export async function handleForwardEmail(c: AppContext) {
 			cc: cc ? (Array.isArray(cc) ? cc.join(", ") : cc).toLowerCase() : null,
 			bcc: bcc ? (Array.isArray(bcc) ? bcc.join(", ") : bcc).toLowerCase() : null,
 			date: new Date().toISOString(),
-			body: html || text || "",
+			body_html: html || null,
+			body_text: text || null,
 			in_reply_to: null,
 			email_references: null,
 			thread_id: messageId,
@@ -189,7 +193,9 @@ export async function handleForwardEmail(c: AppContext) {
 				disposition: att.disposition,
 				contentId: att.contentId,
 			})),
-		}).catch((e) => {
+		})
+			.then(({ messageId: delivered }) => stub.setDeliveredMessageId(messageId, delivered))
+			.catch((e) => {
 			console.error("Deferred forward delivery failed:", (e as Error).message);
 		}),
 	);
