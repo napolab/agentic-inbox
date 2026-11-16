@@ -12,7 +12,6 @@ build/
 .vite/
 dist/
 snapshot-*.txt
-.agents/
 opencode.jsonc
 skills-lock.json
 .DS_Store
