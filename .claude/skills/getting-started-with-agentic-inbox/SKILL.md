@@ -42,6 +42,24 @@ pnpm test                        # durableObject のテストは sqlite3 CLI が
 7. **任意の secret**: `DISCORD_WEBHOOK_URL`、`VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` / `VAPID_SUBJECT`（鍵生成コマンドは `.dev.vars.example`）。未設定なら該当通知はスキップ
 8. **GitHub Actions**: repo secret に `CLOUDFLARE_API_TOKEN`（トークンが複数アカウントに効くなら `CLOUDFLARE_ACCOUNT_ID` も）。fork は Actions タブでワークフローを有効化。`upstream-sync` を使うなら Settings > Actions > General で「Allow GitHub Actions to create and approve pull requests」を ON
 
+## upstream-sync（毎日 06:00 JST）
+
+取り込み元はリポジトリ変数 `UPSTREAM_REPO`（Settings > Secrets and variables > Actions > Variables）で決まる。
+
+| repo | `UPSTREAM_REPO` |
+| --- | --- |
+| napolab/agentic-inbox | `cloudflare/agentic-inbox`（設定済み） |
+| その fork（あなたのデプロイ用 repo） | 未設定のまま = `napolab/agentic-inbox` から取り込む |
+
+- **`.github/workflows/upstream-sync.yml` は編集しない**。全 repo で同一内容に保つ前提で、sync が workflow ファイルを変えないようにしている（Actions のトークンは workflow を変える push ができない）。取り込み元を変えたいときは変数だけ変える
+- job は `main` に upstream を merge したブランチ `upstream-sync` を push して PR を作る。この PR は Actions のトークンで作られるので CI が走らない → 差分を確認してから**必ず merge commit でマージ**（squash / rebase だと同じコミットが毎回取り込み対象に戻る）
+- job が止まったら手元でマージして PR を手で作る:
+  ```bash
+  git switch -c sync-upstream origin/main
+  git fetch https://github.com/napolab/agentic-inbox.git main   # UPSTREAM_REPO の値
+  git merge --no-ff FETCH_HEAD    # 衝突を解消して commit → push → PR → merge commit でマージ
+  ```
+
 ## MCP をつなぐ（推奨: Access + MCP Portal）
 
 Worker の `/mcp`（Streamable HTTP）は Access の後ろにある。クライアントに Access の service token を直接持たせるより、**Cloudflare One の MCP server portal に登録してポータル経由で使う**。ログインは Access の OAuth で済み、ツール単位の可視性やログもポータル側で管理できる。
@@ -86,5 +104,9 @@ Access を通ったユーザーは**全メールボックス**を操作できる
 | Deploy workflow が「CLOUDFLARE_API_TOKEN」で失敗 | repo secret 未登録（手順 8） |
 | typecheck で `DISCORD_WEBHOOK_URL does not exist in type` | `.dev.vars` が無い → `cp .dev.vars.example .dev.vars` |
 | `pnpm deploy` が Worker をデプロイせず pnpm のエラーになる | `pnpm deploy` は pnpm 組み込みコマンド → `pnpm run deploy` か `pnpm run build && pnpm wrangler deploy` |
+| Upstream Sync が「conflicts」で止まる | upstream と main が衝突 → upstream-sync 節の手元マージ |
+| Upstream Sync が「changes .github/workflows」で止まる | upstream が workflow を変えた（トークンでは push 不可）→ 同じく手元マージ（自分の権限なら push できる）。自分で `deploy.yml` などを編集しただけでは起きない |
+| Upstream Sync の push が `refusing to allow a GitHub App to create or update workflow` | 手元の `upstream-sync.yml` が古いか編集されている → upstream の同じファイルの内容に戻す |
+| 同じ upstream コミットが毎回 sync PR に出る | sync PR を squash / rebase でマージした → 手元マージで取り込み、以後 merge commit で |
 | durableObject のテストが `spawnSync sqlite3 ENOENT` | sqlite3 CLI を入れる（CI の ubuntu には入っている） |
 | MCP クライアントの設定に service token を書いて repo に入れた | project スコープの `.mcp.json` は git に入る → token を失効させ、ポータル経由に切り替える |
